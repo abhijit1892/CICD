@@ -35,7 +35,3 @@ jobs:
         run: |
           cdk bootstrap
           cdk deploy --require-approval never
-          
-      - name: Update SageMaker Pipeline
-        run: |
-          python pipeline/deploy_pipeline.py
