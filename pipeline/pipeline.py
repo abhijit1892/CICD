@@ -123,11 +123,17 @@ def get_pipeline(
         property_files=[evaluation_report],
     )
     
+    from sagemaker.workflow.functions import Join
+    
     # 4. Register Model Step (Conditional)
     model_metrics = ModelMetrics(
         model_statistics=MetricsSource(
-            s3_uri="{}/evaluation.json".format(
-                eval_step.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+            s3_uri=Join(
+                on="/",
+                values=[
+                    eval_step.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
+                    "evaluation.json"
+                ]
             ),
             content_type="application/json"
         )
