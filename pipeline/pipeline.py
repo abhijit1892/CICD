@@ -134,7 +134,7 @@ def get_pipeline(
                     eval_step.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
                     "evaluation.json"
                 ]
-            ),
+            ).to_string(),
             content_type="application/json"
         )
     )
