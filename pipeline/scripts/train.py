@@ -4,7 +4,6 @@ import json
 import logging
 import cv2
 import random
-import shutil
 
 import detectron2
 from detectron2.utils.logger import setup_logger
@@ -39,89 +38,63 @@ class MyTrainer(DefaultTrainer):
         mapper = DatasetMapper(cfg, is_train=True, augmentations=augmentations)
         return build_detection_train_loader(cfg, mapper=mapper)
 
-def prepare_data(data_dir, work_dir):
-    logger.info(f"Preparing data from {data_dir} to {work_dir}")
-    train_dir = os.path.join(work_dir, "train")
-    test_dir = os.path.join(work_dir, "test")
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(test_dir, exist_ok=True)
-    
-    annot_path = None
-    for root, dirs, files in os.walk(data_dir):
-        if "annotations.json" in files:
-            annot_path = os.path.join(root, "annotations.json")
-            data_dir = root
-            break
-            
-    with open(annot_path) as f:
+def get_num_classes(annot_path):
+    with open(annot_path, 'r') as f:
         coco = json.load(f)
-        
-    images = coco["images"]
-    annotations = coco["annotations"]
-    categories = coco["categories"]
-
-    random.shuffle(images)
-    split_ratio = 0.8
-    split_idx = int(len(images) * split_ratio)
-    train_images = images[:split_idx]
-    test_images = images[split_idx:]
-
-    train_ids = set([img["id"] for img in train_images])
-    test_ids = set([img["id"] for img in test_images])
-
-    train_annotations = [ann for ann in annotations if ann["image_id"] in train_ids]
-    test_annotations = [ann for ann in annotations if ann["image_id"] in test_ids]
-
-    for img in train_images:
-        shutil.copy(os.path.join(data_dir, img["file_name"]), os.path.join(train_dir, img["file_name"]))
-    for img in test_images:
-        shutil.copy(os.path.join(data_dir, img["file_name"]), os.path.join(test_dir, img["file_name"]))
-
-    train_coco = {"images": train_images, "annotations": train_annotations, "categories": categories}
-    test_coco = {"images": test_images, "annotations": test_annotations, "categories": categories}
-
-    with open(os.path.join(train_dir, "_annotations.coco.json"), "w") as f:
-        json.dump(train_coco, f)
-    with open(os.path.join(test_dir, "_annotations.coco.json"), "w") as f:
-        json.dump(test_coco, f)
-        
-    return train_dir, test_dir, len(categories)
+    return len(coco.get("categories", []))
 
 def main():
-    # SageMaker paths
+    # SageMaker automatically downloads S3 data to the SM_CHANNEL_TRAIN directory
     data_dir = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
-    output_data_dir = os.environ.get("SM_OUTPUT_DATA_DIR", "/opt/ml/output/data")
     model_dir = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
     
-    # We use a local temp dir for data prep
-    work_dir = "/tmp/data"
-    train_dir, test_dir, num_classes = prepare_data(data_dir, work_dir)
+    logger.info(f"Using dataset from: {data_dir}")
     
-    register_coco_instances("my_dataset_train", {}, os.path.join(train_dir, "_annotations.coco.json"), train_dir)
-    register_coco_instances("my_dataset_test", {}, os.path.join(test_dir, "_annotations.coco.json"), test_dir)
+    # We expect `train` and `test` directories to exist inside the downloaded data
+    train_dir = os.path.join(data_dir, "train")
+    test_dir = os.path.join(data_dir, "test")
     
+    train_annot = os.path.join(train_dir, "annotations.json")
+    test_annot = os.path.join(test_dir, "annotations.json")
+    
+    if not os.path.exists(train_annot):
+        logger.error(f"Cannot find training annotations at {train_annot}")
+        sys.exit(1)
+        
+    num_classes = get_num_classes(train_annot)
+    logger.info(f"Found {num_classes} categories.")
+    
+    # Register the datasets using native COCO paths
+    register_coco_instances("my_dataset_train", {}, train_annot, train_dir)
+    register_coco_instances("my_dataset_test", {}, test_annot, test_dir)
+    
+    # Load Detectron2 Defaults
     cfg = get_cfg()
     cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
     cfg.DATASETS.TRAIN = ("my_dataset_train",)
     cfg.DATASETS.TEST = ("my_dataset_test",)
     cfg.DATALOADER.NUM_WORKERS = 2
+    
+    # Load initialization weights from Model Zoo
     cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
     
     cfg.SOLVER.IMS_PER_BATCH = 2
     cfg.SOLVER.BASE_LR = 0.001
-    cfg.SOLVER.MAX_ITER = 3000
+    cfg.SOLVER.MAX_ITER = 30
     cfg.SOLVER.WEIGHT_DECAY = 0.0001
     cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 128
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
     
+    # Evaluate every 300 iterations
     cfg.TEST.EVAL_PERIOD = 300
     
-    # Set output dir to SM_MODEL_DIR so trained weights are packaged into model.tar.gz by SageMaker
+    # Output to SM_MODEL_DIR so SageMaker natively tars and ships back to S3
     cfg.OUTPUT_DIR = model_dir
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     
     trainer = MyTrainer(cfg)
     
+    # Register Checkpointer to save best model based on AP50
     best_checkpointer = hooks.BestCheckpointer(
         eval_period=cfg.TEST.EVAL_PERIOD,
         checkpointer=trainer.checkpointer,
@@ -131,10 +104,11 @@ def main():
     )
     trainer.register_hooks([best_checkpointer])
     
+    logger.info("Starting Training...")
     trainer.resume_or_load(resume=False)
     trainer.train()
     
-    logger.info("Training complete. Artifacts saved in SM_MODEL_DIR.")
-    
+    logger.info("Training complete. Models saved successfully in container.")
+
 if __name__ == "__main__":
     main()
